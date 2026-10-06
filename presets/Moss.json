@@ -31,8 +31,34 @@
   "mix_metal": 1.0,
   "mix_ao": 1.0,
   "detail_restore": 0.0,
-  "palette": [],
-  "palette_strength": 0.0,
+  "palette": [
+    [
+      0.55,
+      0.58,
+      0.32
+    ],
+    [
+      0.4,
+      0.48,
+      0.22
+    ],
+    [
+      0.24,
+      0.34,
+      0.18
+    ],
+    [
+      0.16,
+      0.22,
+      0.13
+    ],
+    [
+      0.3,
+      0.24,
+      0.16
+    ]
+  ],
+  "palette_strength": 0.7,
   "palette_hardness": 8.0,
   "tint_warm": [
     0.96,

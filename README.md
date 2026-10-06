@@ -16,7 +16,12 @@ albedo is processed (`--recursive` searches all depths). Output goes to `<set fo
 or to `--out <folder>`. Source files are only read, never written.
 
 Python used by the .bat: `%LOCALAPPDATA%\Programs\Python\Python312\python.exe` (falls back to `py -3.12`).
-Setup if missing: `winget install -e --id Python.Python.3.12`, then `python -m pip install numpy opencv-python pillow`.
+Setup if missing: `winget install -e --id Python.Python.3.12`, then `python -m pip install numpy opencv-python pillow moderngl`.
+`moderngl` is the GPU paint path (OpenGL 4.3 compute). Without it, Kuwahara stays on the CPU. Anisotropic Kuwahara needs the GPU path.
+
+## v1.3
+
+The window is dark. Colour grading runs in Oklab: saturation scales chroma, posterize steps lightness and chroma, and a palette of up to eight swatches can pull colours toward those swatches (`palette_strength` 0 leaves the grade unsnapped). Per-map mix sliders keep a map closer to the source. Detail restore puts source texture back on the albedo. Offset rolls the preview by half a tile and the status line shows the measured seam difference. Seam fade is off until its slider moves. The lit view is Smith GGX plus a small built-in environment, with an exposure slider. Paint mask (amount / smooth / erase) is a per-pixel stylize amount, saved beside a preset as `*_mask.png`, and CONVERT bakes it into the maps.
 
 Examples
 ```

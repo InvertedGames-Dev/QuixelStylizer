@@ -9,7 +9,7 @@ import threading
 import traceback
 from collections import OrderedDict
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, colorchooser
 
 import numpy as np
 import cv2
@@ -36,7 +36,71 @@ SLIDERS = [  # key, label, min, max, step
     ("normal_soften", "Normal softening", 0, 1, 0.05),
     ("normal_strength", "Normal strength", 0, 2, 0.05),
     ("height_soften", "Displacement softening", 0, 1, 0.05),
+    ("mix_normal", "Normal paint mix", 0, 1, 0.05),
+    ("mix_height", "Height paint mix", 0, 1, 0.05),
+    ("mix_rough", "Roughness paint mix", 0, 1, 0.05),
+    ("mix_metal", "Metallic paint mix", 0, 1, 0.05),
+    ("mix_ao", "AO paint mix", 0, 1, 0.05),
+    ("detail_restore", "Detail restore", 0, 1, 0.05),
+    ("palette_strength", "Palette strength", 0, 1, 0.05),
+    ("palette_hardness", "Palette hardness", 1, 32, 0.5),
+    ("seam_fade", "Seam fade", 0, 1, 0.05),
+    ("exposure", "Lit exposure (stops)", -2, 2, 0.05),
 ]
+
+# Dark window. Tk's default theme is a light grey; clam is the one that actually takes these colours.
+_BG = "#1c1c1c"
+_PANEL = "#242424"
+_FG = "#e6e6e6"
+_MUTED = "#9a9a9a"
+_FIELD = "#121212"
+_ACCENT = "#4c8cbf"
+_BUTTON = "#333333"
+
+
+def apply_dark_theme(root):
+    style = ttk.Style(root)
+    try:
+        style.theme_use("clam")
+    except tk.TclError:
+        pass
+    root.configure(bg=_BG)
+    root.option_add("*Background", _BG)
+    root.option_add("*Foreground", _FG)
+    root.option_add("*selectBackground", _ACCENT)
+    root.option_add("*selectForeground", "#ffffff")
+    root.option_add("*TCombobox*Listbox.background", _FIELD)
+    root.option_add("*TCombobox*Listbox.foreground", _FG)
+    root.option_add("*TCombobox*Listbox.selectBackground", _ACCENT)
+    style.configure(".", background=_BG, foreground=_FG, fieldbackground=_FIELD,
+                    troughcolor="#2a2a2a", bordercolor="#3a3a3a", lightcolor=_PANEL, darkcolor=_PANEL)
+    style.configure("TFrame", background=_BG)
+    style.configure("TLabel", background=_BG, foreground=_FG)
+    style.configure("TButton", background=_BUTTON, foreground=_FG, padding=4, bordercolor="#3a3a3a")
+    style.map("TButton", background=[("active", "#3e3e3e"), ("disabled", "#2a2a2a")],
+              foreground=[("disabled", "#777777")])
+    style.configure("TCheckbutton", background=_BG, foreground=_FG)
+    style.map("TCheckbutton", background=[("active", _BG)])
+    style.configure("TRadiobutton", background=_BG, foreground=_FG)
+    style.map("TRadiobutton", background=[("active", _BG)])
+    style.configure("TLabelframe", background=_BG, foreground=_FG, bordercolor="#3a3a3a")
+    style.configure("TLabelframe.Label", background=_BG, foreground=_FG)
+    style.configure("TCombobox", fieldbackground=_FIELD, background=_BUTTON, foreground=_FG, arrowcolor=_FG)
+    style.map("TCombobox", fieldbackground=[("readonly", _FIELD)], foreground=[("readonly", _FG)])
+    style.configure("TEntry", fieldbackground=_FIELD, foreground=_FG, insertcolor=_FG)
+    style.configure("TScrollbar", background=_BUTTON, troughcolor=_BG, arrowcolor=_FG)
+    style.configure("Horizontal.TProgressbar", background=_ACCENT, troughcolor="#2a2a2a")
+
+
+def dark_scale(parent, **kw):
+    sc = tk.Scale(parent, bg=_BG, fg=_FG, troughcolor="#2e2e2e", highlightthickness=0,
+                  activebackground=_ACCENT, sliderrelief="flat", **kw)
+    return sc
+
+
+def _hex_rgb(rgb):
+    r, g, b = [int(round(float(c) * 255)) for c in rgb[:3]]
+    return f"#{r:02x}{g:02x}{b:02x}"
 INT_KEYS = {"passes", "posterize", "size"}
 VIEWS = ["Diffuse", "Lit", "Normal", "Roughness", "AO", "Displacement", "Metallic"]
 PREVIEW_SIZES = [256, 512, 1024]
@@ -68,10 +132,11 @@ def _grey3(a):
     return np.repeat(np.clip(a, 0, 1)[..., None], 3, axis=2)
 
 
-def view_image(view, maps, light):
+def view_image(view, maps, light, exposure=0.0, shade_ao=False):
     """maps: dict with alb, normal, rough, metal, ao, height (stage output or source)."""
     if view == "Lit":
-        return qs.shade_lit(maps["alb"], maps["normal"], maps["rough"], maps["metal"], *light)
+        return qs.shade_lit(maps["alb"], maps["normal"], maps["rough"], maps["metal"], *light,
+                            ao=maps.get("ao"), exposure=exposure, shade_ao=shade_ao)
     if view == "Normal":
         return np.clip(maps["normal"] * 0.5 + 0.5, 0, 1)
     if view == "Roughness":
@@ -85,9 +150,19 @@ def view_image(view, maps, light):
     return maps["alb"]
 
 
+def _roll_half(img):
+    h, w = img.shape[:2]
+    return np.roll(np.roll(img, h // 2, axis=0), w // 2, axis=1)
+
+
 def compose(after, before, job):
-    """Split/before/after, tile 2x2, zoom, fit to canvas. Returns (u8 image, mapping)."""
+    """Split/before/after, half-tile offset, tile 2x2, zoom, fit to canvas. Returns (u8 image, mapping)."""
     mode, split = job["compare"], float(job["split"])
+    base_h, base_w = after.shape[:2]
+    offset = bool(job.get("offset"))
+    if offset:
+        after = _roll_half(after)
+        before = _roll_half(before)
     if job["tile"]:
         after = np.tile(after, (2, 2, 1))
         before = np.tile(before, (2, 2, 1))
@@ -123,7 +198,8 @@ def compose(after, before, job):
             img[:, max(xd - 1, 0):xd + 1] = (255, 255, 255)
             cv2.putText(img, "before", (max(xd - 70, 2), 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
             cv2.putText(img, "after", (min(xd + 6, dw - 50), 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-    return img, {"z": z, "x0": x0, "y0": y0, "dw": dw, "dh": dh, "W": W, "H": H}
+    return img, {"z": z, "x0": x0, "y0": y0, "dw": dw, "dh": dh, "W": W, "H": H,
+                 "base_w": base_w, "base_h": base_h, "offset": offset, "tiled": bool(job["tile"])}
 
 
 class PreviewEngine:
@@ -137,7 +213,16 @@ class PreviewEngine:
         self.fin = (None, None)
         self.before = (None, None)
         self.last = None  # last finished stage outputs (for tests / match checks)
-        threading.Thread(target=self._loop, daemon=True, name="preview").start()
+        self.stopping = False
+        self.thread = threading.Thread(target=self._loop, daemon=False, name="preview")
+        self.thread.start()
+
+    def stop(self):
+        """Ask the preview thread to drop its GL context and exit, then wait."""
+        with self.cond:
+            self.stopping = True
+            self.cond.notify()
+        self.thread.join(timeout=60)
 
     def submit(self, job):
         with self.cond:
@@ -156,21 +241,30 @@ class PreviewEngine:
             self.before = (None, None)
 
     def _loop(self):
-        while True:
-            with self.cond:
-                while self.pending is None:
-                    self.cond.wait()
-                job, self.pending = self.pending, None
+        try:
+            while True:
+                with self.cond:
+                    while self.pending is None and not self.stopping:
+                        self.cond.wait()
+                    if self.stopping:
+                        return
+                    job, self.pending = self.pending, None
+                try:
+                    res = self.render(job)
+                except qs.Cancelled:
+                    continue
+                except Exception:
+                    tb = traceback.format_exc()
+                    qs.log_line("Preview render failed\n" + tb)
+                    self.on_result({"id": job["id"], "error": tb})
+                    continue
+                self.on_result(res)
+        finally:
             try:
-                res = self.render(job)
-            except qs.Cancelled:
-                continue
+                import qs_gpu
+                qs_gpu.release()
             except Exception:
-                tb = traceback.format_exc()
-                qs.log_line("Preview render failed\n" + tb)
-                self.on_result({"id": job["id"], "error": tb})
-                continue
-            self.on_result(res)
+                pass
 
     @staticmethod
     def _put(cache, key, val, keep):
@@ -197,10 +291,11 @@ class PreviewEngine:
             # No mid-render cancel: finishing the in-flight render gives visible updates while a
             # filter slider is being dragged (cancelling made a continuous drag show nothing until
             # release). Stale intermediate requests are still skipped by the latest-wins queue.
-            painted = qs.paint_stage(src, st)
+            painted = qs.paint_dispatch(src, st)
             self._put(self.paint_cache, pk, painted, 6)
             timing["paint"] = (time.perf_counter() - t) * 1000
-        fk = (pk, json.dumps({k: st[k] for k in sorted(st)}, sort_keys=True, default=str))
+        fk = (pk, json.dumps({k: st[k] for k in sorted(st) if k != "_mask"},
+                             sort_keys=True, default=str))
         if self.fin[0] == fk:
             fin = self.fin[1]
         else:
@@ -210,20 +305,23 @@ class PreviewEngine:
             timing["finish"] = (time.perf_counter() - t) * 1000
         self.last = {"src": src, "fin": fin, "st": st}
         light = (float(job["light_az"]), float(job["light_el"]))
+        exposure = float(st.get("exposure", 0) or 0)
+        shade_ao = bool(st.get("shade_ao", False))
         t = time.perf_counter()
-        after = view_image(job["view"], fin, light)
-        bk = (lk, job["view"], light if job["view"] == "Lit" else None)
+        after = view_image(job["view"], fin, light, exposure, shade_ao)
+        bk = (lk, job["view"], light if job["view"] == "Lit" else None, exposure, shade_ao)
         if self.before[0] == bk:
             before = self.before[1]
         else:
-            before = view_image(job["view"], src, light)
+            before = view_image(job["view"], src, light, exposure, shade_ao)
             self.before = (bk, before)
+        seam = qs.seam_metrics(fin["alb"], fin["normal"])
         img, mapping = compose(after, before, job)
         timing["view"] = (time.perf_counter() - t) * 1000
         return {"id": job["id"], "img": img, "map": mapping, "timing": timing,
                 "render_ms": (time.perf_counter() - t0) * 1000, "t_submit": job["t_submit"],
                 "size": (src["W"], src["H"]), "r_px": painted["r_px"], "name": src["name"],
-                "report": src["report"]}
+                "report": src["report"], "seam": seam}
 
 
 # ======================================================================================
@@ -241,7 +339,11 @@ class App:
         self.last_result = None
         self.result_count = 0
         self.engine = PreviewEngine(lambda r: self.q.put(("preview", r)))
+        self.mask = None
+        self.mask_rev = 0
+        apply_dark_theme(root)
         root.title(f"Quixel Stylizer v{qs.TOOL_VERSION}  -  LIVE PREVIEW")
+        root.protocol("WM_DELETE_WINDOW", self.on_close)
         f = self.f = max(1.0, root.winfo_fpixels("1i") / 96.0)
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
         w, h = min(int(1600 * f), int(sw * 0.92)), min(int(1000 * f), int(sh * 0.86))
@@ -262,7 +364,8 @@ class App:
         self.progress.pack(side="right")
         ttk.Label(top, text=f"v{qs.TOOL_VERSION}", foreground="#888").pack(side="right", padx=8)
         self.status = tk.StringVar(value="Add a material folder - the preview loads automatically.")
-        ttk.Label(root, textvariable=self.status, foreground="#0050a0", padding=(10, 0)).pack(side="top", anchor="w")
+        ttk.Label(root, textvariable=self.status, foreground="#8ec1ff", background=_BG,
+                  padding=(10, 0)).pack(side="top", anchor="w")
 
         body = ttk.Frame(root)
         body.pack(side="top", fill="both", expand=True)
@@ -270,7 +373,7 @@ class App:
         # ---------------- left: scrollable side panel ----------------
         side = ttk.Frame(body, padding=(8, 4))
         side.pack(side="left", fill="y")
-        canvas = tk.Canvas(side, highlightthickness=0, width=int(440 * f))
+        canvas = tk.Canvas(side, highlightthickness=0, width=int(440 * f), bg=_BG, highlightbackground=_BG)
         sb = ttk.Scrollbar(side, orient="vertical", command=canvas.yview)
         panel = ttk.Frame(canvas)
         panel.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
@@ -292,7 +395,9 @@ class App:
         root.bind_class("TCombobox", "<MouseWheel>", combo_wheel)
 
         ttk.Label(panel, text="Material folders (set or parent folders):").pack(anchor="w")
-        self.lb = tk.Listbox(panel, height=4, width=56, selectmode="browse", exportselection=False)
+        self.lb = tk.Listbox(panel, height=4, width=56, selectmode="browse", exportselection=False,
+                             bg=_FIELD, fg=_FG, selectbackground=_ACCENT, selectforeground="#ffffff",
+                             highlightthickness=0, relief="flat", activestyle="none")
         self.lb.pack(fill="x")
         self.lb.bind("<<ListboxSelect>>", self.on_folder_select)
         bf = ttk.Frame(panel)
@@ -339,7 +444,7 @@ class App:
         row2 = ttk.Frame(opt)
         row2.pack(fill="x", pady=2)
         for key, text in (("flip_green", "Flip source green"), ("tile", "Tileable (wrap)"),
-                          ("preview", "Write preview PNG")):
+                          ("preview", "Write preview PNG"), ("shade_ao", "AO again in Lit view")):
             self.vars[key] = tk.BooleanVar(value=bool(settings[key]))
             ttk.Checkbutton(row2, text=text, variable=self.vars[key]).pack(side="left", padx=(0, 8))
         row3 = ttk.Frame(opt)
@@ -358,13 +463,44 @@ class App:
             ttk.Label(fr, text=text, width=23).pack(side="left")
             v = tk.DoubleVar(value=float(settings[key]))
             self.vars[key] = v
-            sc = tk.Scale(fr, variable=v, from_=lo, to=hi, resolution=step, orient="horizontal",
-                          length=int(210 * f), showvalue=True)
+            sc = dark_scale(fr, variable=v, from_=lo, to=hi, resolution=step, orient="horizontal",
+                            length=int(180 * f), showvalue=False)
             sc.pack(side="left", fill="x", expand=True)
+            ent = ttk.Entry(fr, width=6, textvariable=v)
+            ent.pack(side="left", padx=(4, 0))
             self.scales[key] = sc
-        self.extra = {k: settings[k] for k in qs.DEFAULTS if k not in self.vars}
+        self.extra = {}
+        for k in qs.DEFAULTS:
+            if k in self.vars:
+                continue
+            v = settings[k]
+            if k == "palette":
+                self.extra[k] = [list(map(float, c)) for c in (v or [])]
+            elif isinstance(v, list):
+                self.extra[k] = [float(x) for x in v]
+            else:
+                self.extra[k] = v
+        pal = ttk.Frame(opt)
+        pal.pack(fill="x", pady=(4, 0))
+        ttk.Label(pal, text="Palette").pack(side="left")
+        self.swatch_row = ttk.Frame(pal)
+        self.swatch_row.pack(side="left", padx=4)
+        ttk.Button(pal, text="+", width=2, command=self.add_swatch).pack(side="left")
+        for name in ("plaster", "stone", "moss"):
+            ttk.Button(pal, text=name, command=lambda n=name: self.use_palette(n)).pack(side="left", padx=2)
+        tint = ttk.Frame(opt)
+        tint.pack(fill="x", pady=2)
+        ttk.Label(tint, text="Tint").pack(side="left")
+        self.warm_btn = tk.Button(tint, text="warm", command=lambda: self.pick_tint("tint_warm"),
+                                  relief="flat", bd=0)
+        self.warm_btn.pack(side="left", padx=4)
+        self.cool_btn = tk.Button(tint, text="cool", command=lambda: self.pick_tint("tint_cool"),
+                                  relief="flat", bd=0)
+        self.cool_btn.pack(side="left")
+        self.sync_palette_ui()
         ttk.Label(panel, text=f"Log (errors also go to {qs.LOG_PATH}):", wraplength=int(420 * f)).pack(anchor="w")
-        self.log = tk.Text(panel, height=8, width=56)
+        self.log = tk.Text(panel, height=8, width=56, bg=_FIELD, fg=_FG, insertbackground=_FG,
+                           relief="flat", highlightthickness=0)
         self.log.pack(fill="x")
         panel.update_idletasks()
         canvas.configure(width=max(panel.winfo_reqwidth(), int(400 * f)))
@@ -383,6 +519,8 @@ class App:
             ttk.Radiobutton(tb, text=m, value=m, variable=self.pv["compare"]).pack(side="left")
         self.pv["tile"] = tk.BooleanVar(value=False)
         ttk.Checkbutton(tb, text="Tile 2x2", variable=self.pv["tile"]).pack(side="left", padx=8)
+        self.pv["offset"] = tk.BooleanVar(value=False)
+        ttk.Checkbutton(tb, text="Offset", variable=self.pv["offset"]).pack(side="left")
         ttk.Label(tb, text="Zoom").pack(side="left")
         self.pv["zoom"] = tk.StringVar(value="Fit")
         ttk.Combobox(tb, textvariable=self.pv["zoom"], values=["Fit", "1x", "2x"], width=4, state="readonly").pack(side="left", padx=4)
@@ -401,11 +539,28 @@ class App:
         for key, text, lo, hi, res in (("split", "Split", 0, 1, 0.01), ("light_az", "Light angle", 0, 360, 1),
                                        ("light_el", "Light height", 5, 90, 1)):
             ttk.Label(tb2, text=text).pack(side="left", padx=(6, 0))
-            tk.Scale(tb2, variable=self.pv[key], from_=lo, to=hi, resolution=res, orient="horizontal",
-                     length=int(150 * f), showvalue=False).pack(side="left")
-        ttk.Label(tb2, text="  Left-drag: move split (or light in Lit view w/o split).  Right-drag: light.",
-                  foreground="#666").pack(side="left")
-        self.pcanvas = tk.Canvas(right, background="#202020", highlightthickness=0)
+            dark_scale(tb2, variable=self.pv[key], from_=lo, to=hi, resolution=res, orient="horizontal",
+                       length=int(120 * f), showvalue=False).pack(side="left")
+        ttk.Label(tb2, text="  Right-drag: light.", foreground=_MUTED, background=_BG).pack(side="left")
+        tb3 = ttk.Frame(right)
+        tb3.pack(fill="x", pady=(0, 2))
+        self.paint_mask = tk.BooleanVar(value=False)
+        ttk.Checkbutton(tb3, text="Paint mask", variable=self.paint_mask).pack(side="left")
+        self.mask_tool = tk.StringVar(value="amount")
+        for name in ("amount", "smooth", "erase"):
+            ttk.Radiobutton(tb3, text=name, value=name, variable=self.mask_tool).pack(side="left", padx=2)
+        ttk.Label(tb3, text="Brush").pack(side="left", padx=(8, 0))
+        self.brush = tk.DoubleVar(value=24)
+        dark_scale(tb3, variable=self.brush, from_=2, to=80, resolution=1, orient="horizontal",
+                   length=int(90 * f), showvalue=False).pack(side="left")
+        ttk.Label(tb3, text="Amount").pack(side="left", padx=(6, 0))
+        self.brush_amount = tk.DoubleVar(value=0.0)
+        dark_scale(tb3, variable=self.brush_amount, from_=0, to=1, resolution=0.05, orient="horizontal",
+                   length=int(80 * f), showvalue=False).pack(side="left")
+        ttk.Button(tb3, text="Clear mask", command=self.clear_mask).pack(side="left", padx=6)
+        self.seam_var = tk.StringVar(value="")
+        ttk.Label(tb3, textvariable=self.seam_var, foreground=_MUTED).pack(side="right")
+        self.pcanvas = tk.Canvas(right, background="#141414", highlightthickness=0)
         self.pcanvas.pack(fill="both", expand=True)
         self.pc_img = self.pcanvas.create_image(0, 0, anchor="nw")
         self.pc_text = self.pcanvas.create_text(20, 20, anchor="nw", fill="#bbbbbb",
@@ -425,6 +580,18 @@ class App:
         qs.log_line(f"GUI start v{qs.TOOL_VERSION} code={qs.MODULE_PATH} gui={os.path.abspath(__file__)} "
                     f"pid={os.getpid()}")
         self.say(qs.version_banner())
+        try:
+            import qs_gpu
+            gpu = qs_gpu.status()
+            line = "GPU paint: " + gpu.get("reason", "")
+            qs.log_line(line)
+            self.say(line)
+            # The check ran on this thread. Drop the context here so Tk does not
+            # share it, and so process exit does not destroy it from the wrong place.
+            qs_gpu.release()
+        except Exception as exc:
+            qs.log_line(f"GPU paint: {exc}")
+            self.say(f"GPU paint: {exc}")
         warn = qs.old_window_warning()
         if warn:
             qs.log_line("WARNING " + warn)
@@ -440,6 +607,11 @@ class App:
     def settings(self):
         st = dict(qs.DEFAULTS)
         st.update(self.extra)
+        # Copy the lists so a render in flight does not share the swatch row's storage.
+        pal = self.extra.get("palette") or []
+        st["palette"] = [list(map(float, c)) for c in pal]
+        for key in ("tint_warm", "tint_cool"):
+            st[key] = [float(x) for x in self.extra.get(key, qs.DEFAULTS[key])]
         for k, v in self.vars.items():
             try:
                 val = v.get()
@@ -455,8 +627,16 @@ class App:
             if k in st:
                 v.set(str(st[k]) if isinstance(v, tk.StringVar) else st[k])
         for k in self.extra:
-            if k in st:
-                self.extra[k] = st[k]
+            if k not in st:
+                continue
+            v = st[k]
+            if k == "palette":
+                self.extra[k] = [list(map(float, c)) for c in (v or [])]
+            elif isinstance(v, list):
+                self.extra[k] = [float(x) for x in v]
+            else:
+                self.extra[k] = v
+        self.sync_palette_ui()
         self.request()
 
     def folders(self):
@@ -536,12 +716,133 @@ class App:
                 return
         messagebox.showinfo("Quixel Stylizer", "No output folder yet - run CONVERT first.")
 
+    def sync_palette_ui(self):
+        for child in self.swatch_row.winfo_children():
+            child.destroy()
+        palette = self.extra.get("palette") or []
+        for i, rgb in enumerate(list(palette)[:8]):
+            btn = tk.Button(self.swatch_row, text=" ", width=2, bg=_hex_rgb(rgb),
+                            activebackground=_hex_rgb(rgb), relief="flat", bd=0,
+                            command=lambda i=i: self.edit_swatch(i))
+            btn.pack(side="left", padx=1)
+            btn.bind("<Button-3>", lambda e, i=i: self.remove_swatch(i))
+        self.warm_btn.configure(bg=_hex_rgb(self.extra.get("tint_warm", qs.DEFAULTS["tint_warm"])))
+        self.cool_btn.configure(bg=_hex_rgb(self.extra.get("tint_cool", qs.DEFAULTS["tint_cool"])))
+
+    def _ask_colour(self, initial):
+        picked = colorchooser.askcolor(color=_hex_rgb(initial), title="Colour")
+        if not picked or not picked[0]:
+            return None
+        r, g, b = picked[0]
+        return [r / 255.0, g / 255.0, b / 255.0]
+
+    def add_swatch(self):
+        palette = list(self.extra.get("palette") or [])
+        if len(palette) >= 8:
+            self.status.set("Palette holds 8 swatches. Right-click one to remove it.")
+            return
+        rgb = self._ask_colour(palette[-1] if palette else [0.7, 0.7, 0.7])
+        if rgb is None:
+            return
+        palette.append(rgb)
+        self.extra["palette"] = palette
+        self.sync_palette_ui()
+        self.request()
+
+    def edit_swatch(self, index):
+        palette = list(self.extra.get("palette") or [])
+        if index >= len(palette):
+            return
+        rgb = self._ask_colour(palette[index])
+        if rgb is None:
+            return
+        palette[index] = rgb
+        self.extra["palette"] = palette
+        self.sync_palette_ui()
+        self.request()
+
+    def remove_swatch(self, index):
+        palette = list(self.extra.get("palette") or [])
+        if index >= len(palette):
+            return
+        del palette[index]
+        self.extra["palette"] = palette
+        self.sync_palette_ui()
+        self.request()
+
+    def use_palette(self, name):
+        self.extra["palette"] = [list(c) for c in qs.PALETTES[name]]
+        if "palette_strength" in self.vars and float(self.vars["palette_strength"].get() or 0) <= 0:
+            self.vars["palette_strength"].set(0.7)
+        self.sync_palette_ui()
+        self.request()
+
+    def pick_tint(self, key):
+        rgb = self._ask_colour(self.extra.get(key, qs.DEFAULTS[key]))
+        if rgb is None:
+            return
+        self.extra[key] = rgb
+        self.sync_palette_ui()
+        self.request()
+
+    def clear_mask(self):
+        self.mask = None
+        self.mask_rev += 1
+        self.request()
+
+    def _paint_mask_at(self, e):
+        m = getattr(self, "_map", None)
+        if not m:
+            return
+        u = (e.x - self._offset[0]) / m["z"] + m["x0"]
+        v = (e.y - self._offset[1]) / m["z"] + m["y0"]
+        bw, bh = int(m["base_w"]), int(m["base_h"])
+        if m.get("tiled"):
+            u %= bw
+            v %= bh
+        if m.get("offset"):
+            u = (u - bw / 2.0) % bw
+            v = (v - bh / 2.0) % bh
+        if self.mask is None or self.mask.shape != (bh, bw):
+            prev = self.mask
+            self.mask = np.ones((bh, bw), np.float32)
+            if prev is not None:
+                self.mask = np.clip(qs.resize(prev, bw, bh), 0, 1).astype(np.float32)
+        radius = max(1, int(round(float(self.brush.get()))))
+        cx, cy = int(round(u)), int(round(v))
+        y0, y1 = cy - radius, cy + radius + 1
+        x0, x1 = cx - radius, cx + radius + 1
+        yy, xx = np.mgrid[y0:y1, x0:x1]
+        dist = np.hypot(xx - cx, yy - cy)
+        weight = np.clip(1.0 - dist / float(radius), 0, 1).astype(np.float32)
+        yy_w = np.mod(yy, bh).astype(int)
+        xx_w = np.mod(xx, bw).astype(int)
+        tool = self.mask_tool.get()
+        if tool == "erase":
+            target = np.ones_like(weight)
+        elif tool == "smooth":
+            blurred = qs.gblur(self.mask, max(radius / 3.0, 0.6), True)
+            target = blurred[yy_w, xx_w]
+        else:
+            target = np.full_like(weight, float(self.brush_amount.get()))
+        current = self.mask[yy_w, xx_w]
+        self.mask[yy_w, xx_w] = current * (1.0 - weight) + target * weight
+        self.mask_rev += 1
+        self.request()
+
     def save_preset(self):
         p = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")],
                                          initialdir=os.path.join(qs.TOOL_DIR, "presets"))
         if p:
             qs.save_preset(p, self.settings())
-            self.say(f"preset saved: {p}")
+            mp = qs.mask_path_for(p)
+            if self.mask is not None and float(np.min(self.mask)) < 0.999:
+                qs.save_mask(mp, self.mask)
+                self.say(f"preset saved: {p}  mask: {mp}")
+            else:
+                if os.path.isfile(mp):
+                    os.remove(mp)
+                self.say(f"preset saved: {p}")
 
     def load_preset(self):
         p = filedialog.askopenfilename(filetypes=[("JSON", "*.json")],
@@ -549,7 +850,11 @@ class App:
         if p:
             try:
                 self.apply(dict(qs.DEFAULTS, **qs.load_preset(p)))
-                self.say(f"preset loaded: {p}")
+                loaded = qs.load_mask(qs.mask_path_for(p))
+                self.mask = loaded
+                self.mask_rev += 1
+                self.say(f"preset loaded: {p}" + (" with mask" if loaded is not None else ""))
+                self.request()
             except Exception as e:
                 qs.log_line(f"GUI preset load failed {p}\n{traceback.format_exc()}")
                 messagebox.showerror("Preset", str(e))
@@ -572,6 +877,9 @@ class App:
             job = {k: v.get() for k, v in self.pv.items() if k != "psize"}
         except tk.TclError:
             return None
+        if self.mask is not None:
+            st["_mask"] = np.array(self.mask, np.float32, copy=True)
+            st["_mask_rev"] = self.mask_rev
         job.update(set=s, st=st, cw=self.pcanvas.winfo_width(), ch=self.pcanvas.winfo_height())
         job["pk"] = qs.stage_keys(s, st)[1]
         return job
@@ -630,6 +938,11 @@ class App:
         self.indicator.set(("rendering...  " if pending else "") +
                            f"updated in {total:.0f} ms  [{parts} view {tm.get('view', 0):.0f}]  "
                            f"{r['size'][0]}x{r['size'][1]} r={r['r_px']}px")
+        seam = r.get("seam")
+        if seam:
+            self.seam_var.set(
+                f"seam  D {seam['diffuse_lr']:.3f}/{seam['diffuse_tb']:.3f}"
+                f"   N {seam['normal_lr']:.3f}/{seam['normal_tb']:.3f}")
         if self.status.get().startswith(("Add a material", "Folder added")):
             notes = "; ".join(r["report"]["notes"][-1:])
             self.status.set(f"Previewing {r['name']}" + (f" - {notes}" if notes else ""))
@@ -641,6 +954,9 @@ class App:
         return ((x - self._offset[0]) / m["z"] + m["x0"]) / m["W"]
 
     def on_left(self, e):
+        if self.paint_mask.get():
+            self._paint_mask_at(e)
+            return
         if self.pv["compare"].get() == "Split":
             v = self._canvas_to_img_x(e.x)
             if v is not None:
@@ -680,6 +996,15 @@ class App:
             pass
         self.root.after(30, self.poll)
 
+    def on_close(self):
+        self.engine.stop()
+        try:
+            import qs_gpu
+            qs_gpu.release()
+        except Exception:
+            pass
+        self.root.destroy()
+
     def error_box(self, title, text):
         self.q.put(("call", lambda: messagebox.showerror(title, text[-3000:])))
 
@@ -700,6 +1025,11 @@ class App:
                 self.q.put(("status", f"{name} failed: {e}  (see {qs.LOG_PATH})"))
                 self.error_box(f"Quixel Stylizer - {name} failed", f"{tb}\nLogged to {qs.LOG_PATH}")
             finally:
+                try:
+                    import qs_gpu
+                    qs_gpu.release()
+                except Exception:
+                    pass
                 self.q.put(("done", None))
         threading.Thread(target=wrap, daemon=True).start()
         return True
@@ -712,6 +1042,9 @@ class App:
                                    "folder (or a parent folder), then CONVERT.")
             return False
         st, rec = self.settings(), self.recursive.get()
+        if self.mask is not None:
+            st["_mask"] = np.array(self.mask, np.float32, copy=True)
+            st["_mask_rev"] = self.mask_rev
         out = self.out_var.get().strip() or None
         qs.log_line(f"GUI convert v{qs.TOOL_VERSION} code={qs.MODULE_PATH}: folders={folders} out={out!r} "
                     f"recursive={rec} size={st['size']} format={st['format']}")
@@ -779,6 +1112,7 @@ def run_gui(settings=None, folders=None, selftest=False):
     if selftest:
         root.update()
         st = app.settings()
+        app.engine.stop()
         root.destroy()
         print("GUI selftest ok; settings round-trip:", json.dumps(st))
         return 0

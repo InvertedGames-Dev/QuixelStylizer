@@ -23,7 +23,7 @@ os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
 import numpy as np
 import cv2
 
-TOOL_VERSION = "1.2.3"
+TOOL_VERSION = "1.3.0"
 MODULE_PATH = os.path.abspath(__file__)
 TOOL_DIR = os.path.dirname(MODULE_PATH)
 WINDOW_TITLE_PREFIX = "Quixel Stylizer v"
@@ -151,7 +151,7 @@ REF_SIZE = 1024  # radii / blur widths are specified in pixels at this size and 
 
 DEFAULTS = {
     "size": 1024,                 # output size (longest side): 256/512/1024/2048
-    "filter": "kuwahara",         # kuwahara | kuwahara_classic | median | bilateral
+    "filter": "kuwahara",         # kuwahara | kuwahara_classic | anisotropic | median | bilateral
     "radius": 6.0,                # paint radius, px at 1024 (scaled with size)
     "passes": 2,                  # filter passes
     "sharpness": 8.0,             # Kuwahara sector selectivity (q); higher = harder edges
@@ -176,9 +176,48 @@ DEFAULTS = {
     "tile": True,                 # wrap borders (Megascans surfaces are tileable)
     "preview": True,              # write <Name>_preview.png
     "format": "png",              # png | tga  (texture outputs; preview stays PNG)
+    # 0 = keep the source map, 1 = fully painted. Albedo stays the paint guide.
+    "mix_normal": 1.0,
+    "mix_height": 1.0,
+    "mix_rough": 1.0,
+    "mix_metal": 1.0,
+    "mix_ao": 1.0,
+    "detail_restore": 0.0,        # add a high-pass of the source albedo back after the paint
+    "palette": [],                # up to 8 sRGB swatches, 0..1. Empty = no snap
+    "palette_strength": 0.0,      # 0 leaves the Oklab grade unsnapped
+    "palette_hardness": 8.0,      # higher = flatter poster colours
+    "tint_warm": [0.96, 0.78, 0.55],
+    "tint_cool": [0.55, 0.68, 0.82],
+    "seam_fade": 0.0,             # 0 = off. Cross-fade a band across the wrap
+    "exposure": 0.0,              # stops on the lit view, 2^exposure
+    "shade_ao": False,            # multiply the lit view by AO again (AO is already in the diffuse)
 }
 SIZES = [256, 512, 1024, 2048]
-FILTERS = ["kuwahara", "kuwahara_classic", "median", "bilateral"]
+FILTERS = ["kuwahara", "kuwahara_classic", "anisotropic", "median", "bilateral"]
+# Built-in Oklab palette starting points. Taste, not measurements. Strength stays 0 until a preset sets it.
+PALETTES = {
+    "plaster": [
+        [0.93, 0.90, 0.84],
+        [0.86, 0.78, 0.66],
+        [0.72, 0.58, 0.44],
+        [0.55, 0.40, 0.32],
+        [0.40, 0.32, 0.28],
+    ],
+    "stone": [
+        [0.78, 0.80, 0.81],
+        [0.62, 0.64, 0.66],
+        [0.45, 0.49, 0.52],
+        [0.32, 0.35, 0.38],
+        [0.24, 0.26, 0.28],
+    ],
+    "moss": [
+        [0.55, 0.58, 0.32],
+        [0.40, 0.48, 0.22],
+        [0.24, 0.34, 0.18],
+        [0.16, 0.22, 0.13],
+        [0.30, 0.24, 0.16],
+    ],
+}
 
 # --------------------------------------------------------------------------------------
 # Map detection
@@ -425,7 +464,10 @@ def kuwahara_pass(img, guides, r, q, tile, classic=False, cancel=None):
     Planar implementation: every channel is a contiguous 2D plane, convolved with cropped
     sector kernels via cv2.filter2D and accumulated with cv2.accumulateProduct (fast, threaded)."""
     ks = kuwahara_kernels(r, classic)
-    p = r
+    # Pad one past the kernel. filter2D still consults its own border mode on the
+    # last pad pixel, which would break the wrap. The extra pixel keeps every tap
+    # inside the wrapped pad, matching the GPU's explicit wrap.
+    p = r + 1
     H, W = img.shape[:2]
     C = img.shape[2]
     border = cv2.BORDER_WRAP if tile else cv2.BORDER_REFLECT_101
@@ -490,23 +532,39 @@ def kuwahara_pass(img, guides, r, q, tile, classic=False, cancel=None):
     return np.dstack(outc).astype(np.float32), gout
 
 
+def _median_float(channel, k):
+    """Same-size median. ksize 3 and 5 stay on OpenCV's float path. Larger kernels are
+    true float medians in row chunks: OpenCV's large-kernel medianBlur is 8-bit only,
+    and routing a float plane through that quantize/dequantize step banded the map."""
+    channel = np.ascontiguousarray(channel, dtype=np.float32)
+    if k <= 5:
+        return cv2.medianBlur(channel, k)
+    pad = k // 2
+    # The caller already padded for the tile/reflect border. This pad is only so the
+    # window view's interior matches `channel`. edge here is unused: we crop it off.
+    padded = np.pad(channel, pad, mode="edge")
+    out = np.empty_like(channel)
+    H = channel.shape[0]
+    step = 8
+    for y in range(0, H, step):
+        y1 = min(y + step, H)
+        slab = padded[y:y1 + 2 * pad]
+        win = np.lib.stride_tricks.sliding_window_view(slab, (k, k))
+        out[y:y1] = np.median(win, axis=(-1, -2))
+    return out
+
+
 def simple_filter(img, method, r, tile):
     p = r + 1
     ip = _pad(img, p, tile)
+    k = 2 * r + 1
     if method == "median":
-        k = 2 * r + 1
         if ip.ndim == 3:
-            chans = [ip[..., i] for i in range(ip.shape[2])]
+            out = np.stack([_median_float(ip[..., i], k) for i in range(ip.shape[2])], axis=2)
         else:
-            chans = [ip]
-        res = []
-        for c in chans:
-            lo, hi = float(c.min()), float(c.max())
-            u8 = to_u8((c - lo) / (hi - lo + 1e-8))
-            res.append(cv2.medianBlur(u8, k).astype(np.float32) / 255.0 * (hi - lo + 1e-8) + lo)
-        out = np.stack(res, axis=2) if ip.ndim == 3 else res[0]
+            out = _median_float(ip, k)
     else:  # bilateral
-        out = cv2.bilateralFilter(ip.astype(np.float32), 2 * r + 1, 0.12, max(r, 1))
+        out = cv2.bilateralFilter(ip.astype(np.float32), k, 0.12, max(r, 1))
     return out[p:-p, p:-p].astype(np.float32)
 
 
@@ -610,34 +668,102 @@ def smoothstep(e0, e1, x):
     return t * t * (3 - 2 * t)
 
 
+# Björn Ottosson, Oklab. sRGB linear -> LMS, cube root, then Lab. Round-trips white to L=1.
+_OK_M1 = np.array([
+    [0.4122214708, 0.5363325363, 0.0514459929],
+    [0.2119034982, 0.6806995451, 0.1073969566],
+    [0.0883024619, 0.2817188376, 0.6299787005],
+], np.float64)
+_OK_M2 = np.array([
+    [0.2104542553, 0.7936177850, -0.0040720468],
+    [1.9779984951, -2.4285922050, 0.4505937099],
+    [0.0259040371, 0.7827717662, -0.8086757660],
+], np.float64)
+_OK_M2_INV = np.linalg.inv(_OK_M2)
+_OK_M1_INV = np.linalg.inv(_OK_M1)
+
+
+def srgb_to_oklab(rgb):
+    """rgb is sRGB 0..1, any shape (..., 3). Returns Oklab float32."""
+    lin = srgb_to_linear(np.asarray(rgb, np.float32)).astype(np.float64)
+    lms = np.matmul(lin, _OK_M1.T)
+    np.maximum(lms, 0, out=lms)
+    lms = np.cbrt(lms)
+    return np.matmul(lms, _OK_M2.T).astype(np.float32)
+
+
+def oklab_to_srgb(lab):
+    lab64 = np.asarray(lab, np.float64)
+    lms = np.matmul(lab64, _OK_M2_INV.T)
+    lin = np.matmul(lms * lms * lms, _OK_M1_INV.T)
+    return linear_to_srgb(lin.astype(np.float32))
+
+
+def _as_rgb_list(value, fallback):
+    try:
+        rgb = [float(value[0]), float(value[1]), float(value[2])]
+    except (TypeError, ValueError, IndexError):
+        rgb = list(fallback)
+    return np.clip(np.array(rgb, np.float32), 0, 1)
+
+
 def colour_grade(rgb, st):
-    out = rgb.copy()
-    L = luma(out)
+    """Grade in Oklab so lightness, chroma, and hue come apart.
+
+    Posterize steps L and chroma. Hue stays continuous unless a palette is set,
+    in which case pixels soften toward those swatches. palette_strength 0 is the
+    grade alone, which is how DEFAULTS opens.
+    """
+    lab = srgb_to_oklab(np.clip(rgb, 0, 1))
     vc = float(st["value_compression"])
     if vc:
+        L = lab[..., 0]
         Lm = float(L.mean())
-        out += ((Lm + (L - Lm) * (1 - vc)) - L)[..., None]
-        L = luma(out)
+        lab[..., 0] = Lm + (L - Lm) * (1.0 - vc)
     sat = float(st["saturation"])
     if sat != 1.0:
-        out = L[..., None] + (out - L[..., None]) * sat
+        lab[..., 1:] *= sat
     ts = float(st["tint_strength"])
     if ts:
-        L = luma(np.clip(out, 0, 1))
+        L = lab[..., 0]
         Lm, Ls = float(L.mean()), float(L.std()) + 1e-4
-        t = smoothstep(-1.0, 1.0, (L - Lm) / (1.5 * Ls))[..., None]
-        warm = np.array([1.07, 1.01, 0.88], np.float32)
-        cool = np.array([0.90, 0.97, 1.10], np.float32)
-        tinted = out * (t * warm + (1 - t) * cool)
-        out = out + (tinted - out) * ts
+        t = smoothstep(-1.0, 1.0, (L - Lm) / (1.5 * Ls))
+        warm = srgb_to_oklab(_as_rgb_list(st.get("tint_warm"), DEFAULTS["tint_warm"]))
+        cool = srgb_to_oklab(_as_rgb_list(st.get("tint_cool"), DEFAULTS["tint_cool"]))
+        target_ab = t[..., None] * warm[1:] + (1.0 - t)[..., None] * cool[1:]
+        lab[..., 1:] += (target_ab - lab[..., 1:]) * ts
     lv = int(st["posterize"])
     if lv and lv > 1:
-        L = np.clip(luma(np.clip(out, 0, 1)), 0, 1)
-        x = L * lv
-        fl = np.floor(x)
-        q = (fl + smoothstep(0.3, 0.7, x - fl)) / lv
-        out = out + (q - L)[..., None] * 0.6
-    return np.clip(out, 0, 1).astype(np.float32)
+        # Chroma is quantized against a fixed Oklab range so the steps don't
+        # depend on whichever pixel happens to be the most saturated.
+        chroma_max = 0.4
+        L = np.clip(lab[..., 0], 0, 1)
+        C = np.hypot(lab[..., 1], lab[..., 2])
+        hue_a = lab[..., 1] / (C + 1e-8)
+        hue_b = lab[..., 2] / (C + 1e-8)
+        Lq = np.floor(L * lv) / float(lv)
+        Cq = np.floor(np.clip(C / chroma_max, 0, 1) * lv) / float(lv) * chroma_max
+        lab[..., 0] = Lq
+        lab[..., 1] = hue_a * Cq
+        lab[..., 2] = hue_b * Cq
+    strength = float(st.get("palette_strength", 0) or 0)
+    palette = st.get("palette") or []
+    if strength > 0 and palette:
+        cols = []
+        for swatch in list(palette)[:8]:
+            try:
+                cols.append(srgb_to_oklab(_as_rgb_list(swatch, (0.5, 0.5, 0.5))))
+            except (TypeError, ValueError):
+                continue
+        if cols:
+            cols = np.stack(cols).astype(np.float32)  # N,3
+            dist = np.linalg.norm(lab[..., None, :] - cols, axis=-1)
+            hardness = max(float(st.get("palette_hardness", 8) or 8), 0.01)
+            w = np.exp(-dist * hardness).astype(np.float32)
+            w /= np.maximum(w.sum(axis=-1, keepdims=True), 1e-8)
+            snapped = np.einsum("hwn,nc->hwc", w, cols)
+            lab = lab * (1.0 - strength) + snapped * strength
+    return np.clip(oklab_to_srgb(lab), 0, 1).astype(np.float32)
 
 
 # --------------------------------------------------------------------------------------
@@ -809,27 +935,42 @@ def paint_stage(src, st, cancel=None):
 
 
 def finish_stage(src, painted, st):
-    """Cheap stages: softening, roughness/metal, curvature, colour grade, AO + edge bake."""
+    """Cheap stages: per-map mix, softening, colour grade, AO + edge bake, seam fade, mask.
+
+    The mix and the mask are lerps on maps the paint cache already produced, so dragging
+    them does not re-run Kuwahara.
+    """
     st = dict(DEFAULTS, **st)
     tile = bool(st["tile"])
     W, H = src["W"], src["H"]
     r_px = painted["r_px"]
-    height_f = gblur(painted["height"], float(st["height_soften"]) * r_px * 0.5, tile)
-    n_f = painted["normal"]
+    alb_p = painted["alb"]
+    dr = float(st.get("detail_restore", 0) or 0)
+    if dr:
+        # High-pass of the source colour, so a large brush can stay painterly without going flat.
+        hp = src["alb"] - gblur(src["alb"], max(r_px * 0.35, 0.6), tile)
+        alb_p = np.clip(alb_p + hp * dr, 0, 1)
+    n_p = _mix_map(painted["normal"], src["normal"], st.get("mix_normal", 1))
+    height_p = _mix_map(painted["height"], src["height"], st.get("mix_height", 1))
+    rough_p = _mix_map(painted["rough"], src["rough"], st.get("mix_rough", 1))
+    metal_p = _mix_map(painted["metal"], src["metal"], st.get("mix_metal", 1))
+    ao_p = _mix_map(painted["ao"], src["ao"], st.get("mix_ao", 1))
+    height_f = gblur(height_p, float(st["height_soften"]) * r_px * 0.5, tile)
+    n_f = n_p
     if st["normal_mode"] == "height" and src["height_real"]:
         n_f = normal_from_height(height_f, 32.0 * max(W, H) / REF_SIZE, tile)
     n_f = np.array(gblur(n_f, float(st["normal_soften"]) * r_px * 0.5, tile), np.float32)
     n_f[..., :2] *= float(st["normal_strength"])
     n_f = normalize_normal(n_f)
 
-    rough_f = painted["rough"]
+    rough_f = rough_p
     rm = float(rough_f.mean())
     rough_o = np.clip(rm + (rough_f - rm) * (1 - float(st["roughness_flatten"]))
                       + float(st["roughness_bias"]), 0, 1)
     mb = float(st["metal_binarize"])
-    metal_f = painted["metal"]
+    metal_f = metal_p
     metal_o = np.clip(metal_f * (1 - mb) + smoothstep(0.35, 0.65, metal_f) * mb, 0, 1)
-    ao_o = np.clip(painted["ao"], 0, 1)
+    ao_o = np.clip(ao_p, 0, 1)
 
     cav_f = painted["cavity"]
     cs = st["curvature_source"]
@@ -848,7 +989,7 @@ def finish_stage(src, painted, st):
         curv = np.zeros((H, W), np.float32)
     curv = gblur(curv, scaled(st["edge_blur"], max(W, H)), tile)
 
-    alb = colour_grade(np.clip(painted["alb"], 0, 1), st)
+    alb = colour_grade(np.clip(alb_p, 0, 1), st)
     aos = float(st["ao_strength"])
     if aos:
         alb = linear_to_srgb(srgb_to_linear(alb) * (1 - aos + aos * ao_o)[..., None])
@@ -857,33 +998,207 @@ def finish_stage(src, painted, st):
         c = curv[..., None] * es
         alb = np.where(c > 0, alb + (1 - alb) * c * 0.6, alb * (1 + c * 0.75))
     alb = np.clip(alb, 0, 1).astype(np.float32)
-    return {"alb": alb, "normal": n_f, "height": np.clip(height_f, 0, 1), "rough": rough_o,
-            "metal": metal_o, "ao": ao_o, "curvature_source": cs}
+    fade = float(st.get("seam_fade", 0) or 0)
+    alb = seam_fade(alb, fade, tile)
+    n_f = seam_fade(n_f, fade, tile)
+    height_f = seam_fade(np.clip(height_f, 0, 1), fade, tile)
+    rough_o = seam_fade(rough_o, fade, tile)
+    metal_o = seam_fade(metal_o, fade, tile)
+    ao_o = seam_fade(ao_o, fade, tile)
+    n_f = normalize_normal(np.array(n_f, np.float32))
+    mask = st.get("_mask")
+    if mask is not None:
+        alb = apply_stylize_mask(alb, src["alb"], mask, (H, W))
+        n_f = normalize_normal(apply_stylize_mask(n_f, src["normal"], mask, (H, W)))
+        height_f = apply_stylize_mask(height_f, src["height"], mask, (H, W))
+        rough_o = apply_stylize_mask(rough_o, src["rough"], mask, (H, W))
+        metal_o = apply_stylize_mask(metal_o, src["metal"], mask, (H, W))
+        ao_o = apply_stylize_mask(ao_o, src["ao"], mask, (H, W))
+    return {"alb": np.clip(alb, 0, 1).astype(np.float32), "normal": n_f,
+            "height": np.clip(height_f, 0, 1).astype(np.float32),
+            "rough": np.clip(rough_o, 0, 1).astype(np.float32),
+            "metal": np.clip(metal_o, 0, 1).astype(np.float32),
+            "ao": np.clip(ao_o, 0, 1).astype(np.float32),
+            "curvature_source": cs}
 
 
-def shade_lit(alb_srgb, n_dx, rough, metal, az_deg=135.0, el_deg=45.0):
-    """Preview-only shading: Lambert + GGX-ish spec under one directional light (DX tangent space)."""
-    az, el = np.radians(az_deg), np.radians(el_deg)
+def _smith_g1(nd, a2):
+    nd = np.maximum(nd, 0)
+    return (2.0 * nd) / np.maximum(nd + np.sqrt(a2 + (1.0 - a2) * nd * nd), 1e-6)
+
+
+def _env_radiance(direction):
+    """A fixed studio gradient. z is out of the surface (toward the camera). Not a measured HDRI."""
+    z = np.clip(direction[..., 2], -1, 1)
+    sky = np.array([0.55, 0.62, 0.75], np.float32)
+    horizon = np.array([0.90, 0.82, 0.70], np.float32)
+    ground = np.array([0.16, 0.14, 0.12], np.float32)
+    up = np.clip(z, 0, 1)[..., None]
+    down = np.clip(-z, 0, 1)[..., None]
+    hor = (1.0 - np.abs(z))[..., None]
+    col = sky * up + ground * down + horizon * hor
+    # Keep the sum of weights from blowing the white point on the horizon.
+    return col / np.maximum(up + down + hor, 1e-4)
+
+
+def shade_lit(alb_srgb, n_dx, rough, metal, az_deg=135.0, el_deg=45.0, ao=None,
+              exposure=0.0, shade_ao=False):
+    """Preview shading in the tangent frame. One directional light plus a small environment.
+
+    Smith GGX (D, G, Schlick F). The environment is what metal and rough read as when the
+    key light is edge-on. AO is already baked into the diffuse; shade_ao multiplies it
+    again and is off unless the checkbox is on. exposure is stops (2^exposure).
+    """
+    az, el = np.radians(float(az_deg)), np.radians(float(el_deg))
     L = np.array([np.cos(el) * np.cos(az), -np.cos(el) * np.sin(az), np.sin(el)], np.float32)
-    Hv = L + np.array([0, 0, 1], np.float32)
-    Hv /= np.linalg.norm(Hv)
-    ndl = np.clip(n_dx @ L, 0, 1)
-    ndh = np.clip(n_dx @ Hv, 0, 1)
-    a2 = np.maximum(rough * rough, 0.03) ** 2
-    D = a2 / (np.pi * ((ndh * ndh) * (a2 - 1) + 1) ** 2)
+    V = np.array([0, 0, 1], np.float32)
+    H = L + V
+    H = H / np.linalg.norm(H)
+    n = n_dx.astype(np.float32)
+    ndl = np.clip(n @ L, 0, 1)
+    ndv = np.clip(n[..., 2], 0, 1)
+    ndh = np.clip(n @ H, 0, 1)
+    vdh = float(np.clip(H[2], 0, 1))
+    a = np.maximum(rough, 0.045) ** 2
+    a2 = a * a
+    D = a2 / (np.pi * ((ndh * ndh) * (a2 - 1.0) + 1.0) ** 2 + 1e-6)
+    G = _smith_g1(ndl, a2) * _smith_g1(ndv, a2)
     base = srgb_to_linear(alb_srgb)
     m = metal[..., None]
-    f0 = 0.04 * (1 - m) + base * m
-    diff = base * (1 - m) * (0.22 + 0.95 * ndl[..., None])
-    spec = f0 * (D * ndl * 0.25)[..., None]
-    return linear_to_srgb(np.clip(diff + spec, 0, 1))
+    f0 = 0.04 * (1.0 - m) + base * m
+    fres = (1.0 - vdh) ** 5
+    F = f0 + (1.0 - f0) * fres
+    spec = (D * G)[..., None] * F / np.maximum((4.0 * ndl * ndv)[..., None], 1e-4) * ndl[..., None]
+    kd = (1.0 - F) * (1.0 - m)
+    diff = kd * base * (ndl / np.pi)[..., None]
+    irr = _env_radiance(n)
+    diff_amb = base * (1.0 - m) * irr * 0.45
+    R = n * (2.0 * ndv)[..., None] - V
+    # Rougher surfaces see a flatter environment, so the reflection fades toward the diffuse ambient.
+    spec_amb = _env_radiance(R) * (0.04 * (1.0 - m) + m) * (1.0 - np.clip(rough, 0, 1))[..., None]
+    lin = diff + spec + diff_amb * 0.35 + spec_amb * 0.55
+    if shade_ao and ao is not None:
+        lin = lin * np.clip(ao, 0, 1)[..., None]
+    lin = lin * np.float32(2.0 ** float(exposure))
+    return linear_to_srgb(np.clip(lin, 0, 1))
+
+
+def seam_metrics(alb, normal):
+    """Mean absolute difference across the wrap. Measured, no pass/fail line."""
+    def sides(img):
+        a = img[:, 0].astype(np.float32) - img[:, -1].astype(np.float32)
+        b = img[0, :].astype(np.float32) - img[-1, :].astype(np.float32)
+        return float(np.mean(np.abs(a))), float(np.mean(np.abs(b)))
+    d_lr, d_tb = sides(alb)
+    n_lr, n_tb = sides(normal)
+    return {"diffuse_lr": d_lr, "diffuse_tb": d_tb, "normal_lr": n_lr, "normal_tb": n_tb}
+
+
+def seam_fade(img, strength, tile):
+    """Pull a band inside each edge toward the opposite edge so a near-tileable set joins.
+
+    One-sided: the left band moves toward the right edge (and the top band toward the bottom).
+    Doing both sides would average the seam twice. strength 0 leaves the image alone.
+    """
+    if not tile or strength <= 0 or img is None:
+        return img
+    out = np.array(img, np.float32, copy=True)
+    h, w = out.shape[:2]
+    span = min(h, w)
+    bw = int(round(max(2.0, span * (0.01 + 0.04 * float(strength)))))
+    bw = max(1, min(bw, w // 4, h // 4))
+    ramp = np.linspace(float(strength), 0.0, bw, dtype=np.float32)  #  strongest on the seam
+    if out.ndim == 2:
+        ramp_x = ramp[None, :]
+        ramp_y = ramp[:, None]
+        right = out[:, -bw:][:, ::-1]
+        out[:, :bw] = out[:, :bw] * (1.0 - ramp_x) + right * ramp_x
+        bottom = out[-bw:, :][::-1, :]
+        out[:bw, :] = out[:bw, :] * (1.0 - ramp_y) + bottom * ramp_y
+    else:
+        ramp_x = ramp[None, :, None]
+        ramp_y = ramp[:, None, None]
+        right = out[:, -bw:][:, ::-1]
+        out[:, :bw] = out[:, :bw] * (1.0 - ramp_x) + right * ramp_x
+        bottom = out[-bw:, :][::-1, :]
+        out[:bw, :] = out[:bw, :] * (1.0 - ramp_y) + bottom * ramp_y
+    return out
+
+
+def _mix_map(painted, source, t):
+    t = float(np.clip(t, 0.0, 1.0))
+    if t >= 1.0:
+        return painted
+    if t <= 0.0:
+        return source
+    return source * (1.0 - t) + painted * t
+
+
+def apply_stylize_mask(stylized, source, mask, shape_hw):
+    """mask 1 keeps the stylized pixel, 0 returns the source. Resized to this image."""
+    if mask is None:
+        return stylized
+    m = np.asarray(mask, np.float32)
+    if m.ndim == 3:
+        m = m[..., 0]
+    H, W = shape_hw
+    if m.shape != (H, W):
+        m = resize(m, W, H)
+    m = np.clip(m, 0, 1)
+    if stylized.ndim == 2:
+        return source * (1.0 - m) + stylized * m
+    return source * (1.0 - m[..., None]) + stylized * m[..., None]
+
+
+def paint_dispatch(src, st, cancel=None):
+    """GPU paint for the Kuwahara filters when ModernGL is up. CPU otherwise.
+
+    Anisotropic Kuwahara lives in the GPU kernel. With no GPU it falls through to the
+    generalized Kuwahara and says so on the report.
+    """
+    st = dict(DEFAULTS, **st)
+    method = st["filter"]
+    if method in ("kuwahara", "kuwahara_classic", "anisotropic"):
+        try:
+            import qs_gpu
+            if qs_gpu.available():
+                painted = qs_gpu.paint(src, st, cancel)
+                notes = src.setdefault("report", {}).setdefault("notes", [])
+                note = "paint ran on the GPU (ModernGL compute)"
+                if note not in notes:
+                    notes.append(note)
+                return painted
+        except Exception as exc:
+            log_line(f"GPU paint failed, using CPU: {exc}")
+    if method == "anisotropic":
+        st = dict(st, filter="kuwahara")
+        note = "anisotropic Kuwahara needs the GPU path; this render used kuwahara"
+        notes = src.setdefault("report", {}).setdefault("notes", [])
+        if note not in notes:
+            notes.append(note)
+    return paint_stage(src, st, cancel)
+
+
+def json_settings(st):
+    """Preset/JSON view of settings. Drops the in-memory mask array."""
+    out = {}
+    for key in DEFAULTS:
+        if key not in st:
+            continue
+        value = st[key]
+        if isinstance(value, np.ndarray):
+            continue
+        if isinstance(value, np.generic):
+            value = value.item()
+        out[key] = value
+    return out
 
 
 def process_set(s, st, write=True, out_dir=None, log=print):
     t0 = time.time()
     st = dict(DEFAULTS, **st)
     src = load_stage(s, st)
-    painted = paint_stage(src, st)
+    painted = paint_dispatch(src, st)
     fin = finish_stage(src, painted, st)
     report = dict(src["report"])
     report["curvature_source"] = cs = fin["curvature_source"]
@@ -934,7 +1249,7 @@ def process_set(s, st, write=True, out_dir=None, log=print):
                 "created": time.strftime("%Y-%m-%d %H:%M:%S"), "set_name": name,
                 "source_folder": s["folder"], "code": MODULE_PATH, "output_size": [W, H], "radius_px": r_px,
                 "files_checked": checked,
-                "settings": st, "inputs": report["used"], "defaulted": report["defaulted"],
+                "settings": json_settings(st), "inputs": report["used"], "defaulted": report["defaulted"],
                 "notes": report["notes"], "normal_convention_in": conv,
                 "normal_convention_out": st["normal_out"], "curvature_source": cs,
                 "outputs": files,
@@ -990,7 +1305,23 @@ def load_preset(path):
 
 def save_preset(path, st):
     with open(path, "w", encoding="utf-8") as fh:
-        json.dump({k: st[k] for k in DEFAULTS}, fh, indent=2)
+        json.dump(json_settings(st), fh, indent=2)
+
+
+def mask_path_for(preset_path):
+    base, _ext = os.path.splitext(preset_path)
+    return base + "_mask.png"
+
+
+def save_mask(path, mask):
+    imwrite(path, to_u8(np.clip(mask, 0, 1)))
+
+
+def load_mask(path):
+    if not path or not os.path.isfile(path):
+        return None
+    img = load_gray(path)
+    return np.clip(img, 0, 1).astype(np.float32)
 
 
 def build_parser():

@@ -17,7 +17,7 @@ if not defined PYEXE (
 if not defined PYEXE (
   echo Python 3.12 not found. Install it with:
   echo   winget install -e --id Python.Python.3.12
-  echo then: python -m pip install numpy opencv-python pillow
+  echo then: python -m pip install numpy opencv-python pillow moderngl
   pause
   exit /b 1
 )
