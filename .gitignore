@@ -1,0 +1,8 @@
+stylizer.log
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.idea/
+.vs/
