@@ -1,0 +1,4 @@
+SMAA area and search textures are from Jorge Jimenez et al. (iryoku/smaa),
+MIT License. Copyright (C) 2013 Jorge Jimenez, Jose I. Echevarria, Belen Masia,
+Fernando Navarro, Diego Gutierrez. The generated smaa_area.npy / smaa_search.npy
+are byte-identical to AreaTex.h / SearchTex.h from that project.

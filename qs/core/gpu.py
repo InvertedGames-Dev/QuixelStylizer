@@ -1,32 +1,31 @@
-"""Fused Kuwahara on the GPU.
+"""Fused Kuwahara on the GPU. SSBOs are reused so a pass does not leak VRAM."""
+from __future__ import annotations
 
-One compute dispatch per paint pass. The sector loop stays in the shader, then the
-filtered maps are read back once. Oklab, the lit view, and the mask run on the CPU
-after that readback, so a light drag or a palette drag does not launch the sector
-kernel again. The CPU paint in quixel_stylize.py is the fallback and the match check.
-
-The OpenGL context is per thread. A context created on the Tk thread and used from
-the preview thread (or destroyed at process exit from the wrong thread) faults on
-this machine. release() must run on the thread that created the context.
-"""
 import threading
+
 import numpy as np
 
-_STATE = {"tried": False, "ok": False, "reason": "", "diff": None}
+from qs.core.filter import Cancelled
+from qs.core.recipe import DEFAULTS, scaled
 
+_STATE = {"tried": False, "ok": False, "reason": "", "diff": None}
+# When the Qt widget attaches, compute stays on that thread. Workers never
+# create a second GL context (that is the v1.5 deadlock class).
+_ATTACHED = False
+_ATTACH_IDENT = None
 
 _TENSOR = r"""
 #version 430
 layout(local_size_x = 16, local_size_y = 16) in;
 layout(std430, binding = 0) readonly buffer InA { vec4 A[]; };
 layout(std430, binding = 1) writeonly buffer OutG { vec4 G[]; };
+layout(std430, binding = 2) readonly buffer IslIn { vec4 IslI[]; };
 uniform int width;
 uniform int height;
 uniform int tile_wrap;
+uniform int use_islands;
 
 int wrap_index(int x, int n) {
-    // Integer % on this driver does not follow the GLSL sign rule for a negative
-    // dividend, so a tile's top and left edges sampled the wrong texels.
     if (tile_wrap == 1) {
         return int(floor(mod(float(x), float(n))));
     }
@@ -34,6 +33,12 @@ int wrap_index(int x, int n) {
     int period = 2 * (n - 1);
     int m = int(floor(mod(float(x), float(period))));
     return m < n ? m : period - m;
+}
+
+int island_id(int x, int y) {
+    if (use_islands == 0) return 1;
+    if (x < 0 || y < 0 || x >= width || y >= height) return -1;
+    return int(floor(IslI[y * width + x].x + 0.5));
 }
 
 vec3 at(int x, int y) {
@@ -45,13 +50,18 @@ vec3 at(int x, int y) {
 void main() {
     ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
     if (pix.x >= width || pix.y >= height) return;
+    int my_id = island_id(pix.x, pix.y);
+    if (use_islands == 1 && my_id <= 0) {
+        G[pix.y * width + pix.x] = vec4(0.0);
+        return;
+    }
     float jxx = 0.0, jxy = 0.0, jyy = 0.0;
     float wsum = 0.0;
-    // Small box on the structure tensor. The angle is the edge tangent (gradient + 90 degrees).
     for (int oy = -2; oy <= 2; oy++) {
         for (int ox = -2; ox <= 2; ox++) {
             int x = pix.x + ox;
             int y = pix.y + oy;
+            if (use_islands == 1 && island_id(x, y) != my_id) continue;
             vec3 c1 = at(x + 1, y);
             vec3 c0 = at(x - 1, y);
             vec3 r1 = at(x, y + 1);
@@ -64,6 +74,7 @@ void main() {
             wsum += 1.0;
         }
     }
+    wsum = max(wsum, 1.0);
     jxx /= wsum; jxy /= wsum; jyy /= wsum;
     float ang = 0.5 * atan(2.0 * jxy, jxx - jyy) + 1.57079632679;
     G[pix.y * width + pix.x] = vec4(ang, 0.0, 0.0, 0.0);
@@ -82,6 +93,7 @@ layout(std430, binding = 5) writeonly buffer PakOut { vec4 PakO[]; };
 layout(std430, binding = 6) readonly buffer CavIn { vec4 CavI[]; };
 layout(std430, binding = 7) writeonly buffer CavOut { vec4 CavO[]; };
 layout(std430, binding = 8) readonly buffer AngIn { vec4 AngI[]; };
+layout(std430, binding = 9) readonly buffer IslIn { vec4 IslI[]; };
 uniform int width;
 uniform int height;
 uniform int radius;
@@ -89,10 +101,10 @@ uniform float sharpness;
 uniform int tile_wrap;
 uniform int classic;
 uniform int anisotropic;
+uniform float stretch;
+uniform int use_islands;
 
 int wrap_index(int x, int n) {
-    // Integer % on this driver does not follow the GLSL sign rule for a negative
-    // dividend, so a tile's top and left edges sampled the wrong texels.
     if (tile_wrap == 1) {
         return int(floor(mod(float(x), float(n))));
     }
@@ -133,9 +145,24 @@ vec2 rot(vec2 d, float a) {
     return vec2(c * d.x - s * d.y, s * d.x + c * d.y);
 }
 
+int island_at(int x, int y) {
+    if (use_islands == 0) return 1;
+    if (x < 0 || y < 0 || x >= width || y >= height) return -1;
+    return int(floor(IslI[y * width + x].x + 0.5));
+}
+
 void main() {
     ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
     if (pix.x >= width || pix.y >= height) return;
+    int my_id = island_at(pix.x, pix.y);
+    if (use_islands == 1 && my_id <= 0) {
+        int o = pix.y * width + pix.x;
+        AlbO[o] = AlbI[o];
+        NrmO[o] = NrmI[o];
+        PakO[o] = PakI[o];
+        CavO[o] = CavI[o];
+        return;
+    }
     int nsec = (classic == 1) ? 4 : 8;
     int r = radius;
     float tang = 0.0;
@@ -165,11 +192,19 @@ void main() {
                 vec2 d = vec2(float(ox), float(oy));
                 if (anisotropic == 1) {
                     d = rot(d, -tang);
-                    d.y *= 2.0;
+                    d.y *= stretch;
                 }
                 float w = sector_weight(d, s, nsec);
                 if (w <= 0.0) continue;
-                int id = idx(pix.x + ox, pix.y + oy);
+                int sx = pix.x + ox;
+                int sy = pix.y + oy;
+                int id;
+                if (use_islands == 1) {
+                    if (island_at(sx, sy) != my_id) continue;
+                    id = sy * width + sx;
+                } else {
+                    id = idx(sx, sy);
+                }
                 vec3 c = AlbI[id].rgb;
                 acc += c * w;
                 acc2 += c * c * w;
@@ -233,46 +268,90 @@ def _pack4(img, channels):
     return np.ascontiguousarray(out)
 
 
-class _Gpu:
+class Gpu:
     def __init__(self, ctx):
         self.ctx = ctx
         self.tensor = ctx.compute_shader(_TENSOR)
         self.kuwa = ctx.compute_shader(_KUWAHARA)
+        self._bufs = {}
 
-    def _buf(self, array):
-        return self.ctx.buffer(np.ascontiguousarray(array, np.float32).tobytes())
+    def _ssbo(self, key, nbytes):
+        buf = self._bufs.get(key)
+        if buf is None or buf.size != nbytes:
+            if buf is not None:
+                buf.release()
+            buf = self.ctx.buffer(reserve=nbytes)
+            self._bufs[key] = buf
+        return buf
+
+    def _write4(self, key, array):
+        packed = _pack4(array, array.shape[2] if array.ndim == 3 else 1)
+        buf = self._ssbo(key, packed.nbytes)
+        buf.write(packed.tobytes())
+        return buf
+
+    def _wait_fence(self):
+        """Park until the last dispatch is done. Yield to Qt between polls."""
+        yfn = getattr(_local, "yield_fn", None)
+        try:
+            fence = self.ctx.fence()
+        except Exception:
+            self.ctx.finish()
+            return
+        if yfn is None:
+            fence.wait()
+            return
+        while not fence.wait(timeout=0):
+            yfn()
 
     def _read4(self, buf, h, w):
-        self.ctx.finish()
-        raw = np.frombuffer(buf.read(), np.float32).reshape(h, w, 4).copy()
-        return raw
+        self._wait_fence()
+        return np.frombuffer(buf.read(), np.float32).reshape(h, w, 4).copy()
 
-    def kuwahara_pass(self, alb, normal, pack, cavity, radius, sharpness, tile, classic, anisotropic):
+    def release_buffers(self):
+        for buf in self._bufs.values():
+            try:
+                buf.release()
+            except Exception:
+                pass
+        self._bufs.clear()
+
+    def kuwahara_pass(self, alb, normal, pack, cavity, radius, sharpness, tile, classic, anisotropic,
+                      stretch=1.0, island_ids=None):
         h, w = alb.shape[:2]
-        alb_i = self._buf(_pack4(alb, 3))
-        alb_o = self.ctx.buffer(reserve=h * w * 16)
-        nrm_i = self._buf(_pack4(normal, 3))
-        nrm_o = self.ctx.buffer(reserve=h * w * 16)
-        pak_i = self._buf(_pack4(pack, 4))
-        pak_o = self.ctx.buffer(reserve=h * w * 16)
-        cav_i = self._buf(_pack4(cavity, 1))
-        cav_o = self.ctx.buffer(reserve=h * w * 16)
-        ang = self.ctx.buffer(reserve=h * w * 16)
+        nbytes = h * w * 16
+        alb_i = self._write4("alb_i", alb)
+        alb_o = self._ssbo("alb_o", nbytes)
+        nrm_i = self._write4("nrm_i", normal)
+        nrm_o = self._ssbo("nrm_o", nbytes)
+        pak_i = self._write4("pak_i", pack)
+        pak_o = self._ssbo("pak_o", nbytes)
+        cav_i = self._write4("cav_i", cavity)
+        cav_o = self._ssbo("cav_o", nbytes)
+        ang = self._ssbo("ang", nbytes)
+        use_isl = island_ids is not None
+        if use_isl:
+            isl = self._write4("isl", np.asarray(island_ids, np.float32))
+        else:
+            isl = self._ssbo("isl", 16)
         gx = (w + 15) // 16
         gy = (h + 15) // 16
         if anisotropic:
             alb_i.bind_to_storage_buffer(0)
             ang.bind_to_storage_buffer(1)
+            isl.bind_to_storage_buffer(2)
             self.tensor["width"].value = w
             self.tensor["height"].value = h
             self.tensor["tile_wrap"].value = 1 if tile else 0
+            self.tensor["use_islands"].value = 1 if use_isl else 0
             self.tensor.run(group_x=gx, group_y=gy)
-            self.ctx.finish()
+            self._wait_fence()
         for binding, buf in (
             (0, alb_i), (1, alb_o), (2, nrm_i), (3, nrm_o),
             (4, pak_i), (5, pak_o), (6, cav_i), (7, cav_o), (8, ang),
         ):
             buf.bind_to_storage_buffer(binding)
+        isl.bind_to_storage_buffer(9)
         k = self.kuwa
         k["width"].value = w
         k["height"].value = h
@@ -281,7 +360,10 @@ class _Gpu:
         k["tile_wrap"].value = 1 if tile else 0
         k["classic"].value = 1 if classic else 0
         k["anisotropic"].value = 1 if anisotropic else 0
+        k["stretch"].value = float(stretch if anisotropic else 1.0)
+        k["use_islands"].value = 1 if use_isl else 0
         k.run(group_x=gx, group_y=gy)
+        self._wait_fence()
         alb_n = self._read4(alb_o, h, w)[..., :3]
         nrm_n = self._read4(nrm_o, h, w)[..., :3]
         pak_n = self._read4(pak_o, h, w)
@@ -298,24 +380,77 @@ def _thread_gpu():
 
 
 def release():
-    """Drop this thread's context. Call it on that same thread, before the thread ends."""
     gpu = _thread_gpu()
     if gpu is None:
         return
     try:
-        gpu.ctx.release()
+        gpu.release_buffers()
+        if not _ATTACHED:
+            gpu.ctx.release()
     except Exception:
         pass
     _local.gpu = None
 
 
+def detach_context():
+    """Drop compute SSBOs for the Qt widget. Do not glDelete a dead context's names."""
+    global _ATTACHED, _ATTACH_IDENT
+    gpu = _thread_gpu()
+    if gpu is not None:
+        try:
+            gpu.release_buffers()
+            for sh in (gpu.tensor, gpu.kuwa):
+                try:
+                    sh.release()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        _local.gpu = None
+    if threading.get_ident() == _ATTACH_IDENT:
+        _ATTACHED = False
+        _ATTACH_IDENT = None
+
+
+def attach_context(ctx):
+    """Use an existing ModernGL context (the Qt widget's). Call from that thread."""
+    global _ATTACHED, _ATTACH_IDENT
+    old = _thread_gpu()
+    # Only delete SSBOs if they belong to this same live context. A previous
+    # QOpenGLWidget's Gpu still sitting on _local would glDelete recycled names
+    # on the new widget (pytest smoke then e2e in one process).
+    if old is not None and old.ctx is ctx:
+        try:
+            old.release_buffers()
+        except Exception:
+            pass
+    _local.gpu = Gpu(ctx)
+    _ATTACHED = True
+    _ATTACH_IDENT = threading.get_ident()
+    with _lock:
+        _STATE["tried"] = True
+        _STATE["ok"] = True
+        _STATE["reason"] = "attached Qt/ModernGL context"
+
+
+def set_yield(fn):
+    """Install a no-arg callback invoked while a compute fence is outstanding."""
+    _local.yield_fn = fn
+
+
+def attached() -> bool:
+    return _ATTACHED and threading.get_ident() == _ATTACH_IDENT
+
+
 def _new_gpu():
     import moderngl
     ctx = moderngl.create_standalone_context(require=430)
-    return _Gpu(ctx)
+    return Gpu(ctx)
 
 
 def _ensure():
+    if _ATTACHED:
+        return attached() and _thread_gpu() is not None
     if _thread_gpu() is not None:
         return _STATE["ok"]
     with _lock:
@@ -336,7 +471,6 @@ def _ensure():
                 _STATE["reason"] = "GPU match check did not run"
                 release()
                 return False
-            # The gather and filter2D agree to well under a 2/255 step on a tiled disc.
             if diff > (2.0 / 255.0):
                 _STATE["reason"] = f"GPU Kuwahara differed from the CPU path by {diff:.5f}"
                 release()
@@ -365,16 +499,15 @@ def status():
 
 
 def _match_cpu():
-    """One generalized Kuwahara pass against quixel_stylize.kuwahara_pass. Returns max abs RGB error."""
-    import quixel_stylize as qs
+    from qs.core.filter import kuwahara_pass as cpu_pass
     rng = np.random.RandomState(0)
     h = w = 48
     alb = rng.rand(h, w, 3).astype(np.float32)
     guides = [rng.rand(h, w, 3).astype(np.float32), rng.rand(h, w).astype(np.float32)]
     r = 3
     try:
-        cpu_alb, cpu_guides = qs.kuwahara_pass(alb, guides, r, 8.0, True, classic=False)
-        gpu_alb, gpu_n, gpu_p, _cav = _thread_gpu().kuwahara_pass(
+        cpu_alb, _cpu_guides = cpu_pass(alb, guides, r, 8.0, True, classic=False)
+        gpu_alb, _n, _p, _c = _thread_gpu().kuwahara_pass(
             alb, guides[0], np.dstack([guides[1], guides[1], guides[1], guides[1]]),
             np.zeros((h, w), np.float32), r, 8.0, True, False, False)
     except Exception as exc:
@@ -384,35 +517,72 @@ def _match_cpu():
 
 
 def paint(src, st, cancel=None):
-    """Same dict as quixel_stylize.paint_stage, for the Kuwahara family including anisotropic."""
-    import quixel_stylize as qs
+    from qs.core.stylize import paint_copy
     if not _ensure() or _thread_gpu() is None:
         raise RuntimeError(_STATE["reason"] or "GPU paint unavailable")
-    st = dict(qs.DEFAULTS, **st)
+    st = dict(DEFAULTS, **st)
+    if float(st.get("radius") or 0) <= 0:
+        return paint_copy(src)
     tile = bool(st["tile"])
     W, H = src["W"], src["H"]
-    r_px = max(1, int(round(qs.scaled(st["radius"], max(W, H)))))
+    r_px = max(1, int(round(scaled(st["radius"], max(W, H)))))
     r_px = min(r_px, 48)
     passes = max(1, int(st["passes"]))
     method = st["filter"]
     classic = method == "kuwahara_classic"
-    anisotropic = method == "anisotropic"
-    alb = np.array(src["alb"], np.float32, copy=True)
-    normal = np.array(src["normal"], np.float32, copy=True)
-    height = np.array(src["height"], np.float32, copy=True)
-    rough = np.array(src["rough"], np.float32, copy=True)
-    metal = np.array(src["metal"], np.float32, copy=True)
-    ao = np.array(src["ao"], np.float32, copy=True)
+    stroke = float(st.get("stroke") or 0)
+    if stroke > 0 and method in ("kuwahara", "kuwahara_classic", "anisotropic"):
+        anisotropic = True
+        stretch = 1.0 + 4.0 * min(max(stroke, 0.0), 1.0)
+    elif method == "anisotropic":
+        anisotropic = True
+        stretch = 2.0
+    else:
+        anisotropic = False
+        stretch = 1.0
+    ids = st.get("_island_ids")
+    if ids is None and st.get("island_mask"):
+        from qs.core.io import load_gray
+        ids = np.round(load_gray(st["island_mask"]) * 255).astype(np.int32)
+    if ids is not None:
+        from qs.core.io import resize
+        ids = np.asarray(ids)
+        if ids.shape[:2] != (H, W):
+            ids = np.round(resize(ids.astype(np.float32), W, H)).astype(np.int32)
+        tile = False
+    def _f32(img):
+        arr = np.asarray(img, np.float32)
+        return arr if arr.flags.c_contiguous else np.ascontiguousarray(arr)
+
+    alb = _f32(src["alb"])
+    normal = _f32(src["normal"])
+    height = _f32(src["height"])
+    rough = _f32(src["rough"])
+    metal = _f32(src["metal"])
+    ao = _f32(src["ao"])
     cav = src["cavity"]
-    cav_img = np.zeros((H, W), np.float32) if cav is None else np.array(cav, np.float32, copy=True)
+    cav_img = np.zeros((H, W), np.float32) if cav is None else _f32(cav)
     sharpness = float(st["sharpness"])
+    gpu = _thread_gpu()
     for _i in range(passes):
         if cancel and cancel():
-            raise qs.Cancelled()
+            raise Cancelled()
         pack = np.dstack([height, rough, metal, ao])
-        alb, normal, pack, cav_img = _thread_gpu().kuwahara_pass(
-            alb, normal, pack, cav_img, r_px, sharpness, tile, classic, anisotropic)
+        alb, normal, pack, cav_img = gpu.kuwahara_pass(
+            alb, normal, pack, cav_img, r_px, sharpness, tile, classic, anisotropic, stretch,
+            island_ids=ids)
         height, rough, metal, ao = pack[..., 0], pack[..., 1], pack[..., 2], pack[..., 3]
+    if ids is not None:
+        from qs.core.filter import dilate_islands
+        r_dil = max(2, r_px // 2)
+        alb = dilate_islands(alb, ids, r_dil)
+        normal = dilate_islands(normal, ids, r_dil)
+        height = dilate_islands(height, ids, r_dil)
+        rough = dilate_islands(rough, ids, r_dil)
+        metal = dilate_islands(metal, ids, r_dil)
+        ao = dilate_islands(ao, ids, r_dil)
+        if cav is not None:
+            cav_img = dilate_islands(cav_img, ids, r_dil)
     return {
         "alb": alb.astype(np.float32),
         "normal": normal.astype(np.float32),

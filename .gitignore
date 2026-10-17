@@ -1,4 +1,5 @@
 stylizer.log
+library/
 __pycache__/
 *.py[cod]
 .venv/
@@ -6,3 +7,8 @@ venv/
 *.egg-info/
 .idea/
 .vs/
+.pytest_cache/
+launcher.obj
+launcher.res
+launcher.exp
+launcher.lib
